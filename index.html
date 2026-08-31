@@ -1,0 +1,233 @@
+<!doctype html>
+<!--
+Copyright 2018 The Immersive Web Community Group
+Licensed under the MIT License
+-->
+<html>
+<head>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1, user-scalable=no, viewport-fit=cover'>
+  <meta name='mobile-web-app-capable' content='yes'>
+  <meta name='apple-mobile-web-app-capable' content='yes'>
+  <link rel='icon' type='image/png' sizes='32x32' href='favicon-32x32.png'>
+  <link rel='icon' type='image/png' sizes='96x96' href='favicon-96x96.png'>
+  <link rel='stylesheet' href='css/common.css'>
+  <title>Seguimiento a escala de la habitacion (Magic Window)</title>
+</head>
+<body>
+  <header>
+    <details open>
+      <summary>Escala de habitacion</summary>
+      <p>
+        Haz clic abajo para iniciar. Explora el entorno en 360 grados con la palanca derecha del control Xbox Robot White.
+        Usa la cruceta para fijar ejes: izquierda/derecha bloquea pitch, arriba/abajo bloquea yaw.
+        <a class="back" href="./">Back</a>
+      </p>
+    </details>
+  </header>
+
+  <script type="module">
+    import { WebXRButton } from './js/util/webxr-button.js';
+    import { Scene } from './js/render/scenes/scene.js';
+    import { Renderer, createWebGLContext } from './js/render/core/renderer.js';
+    import { Gltf2Node } from './js/render/nodes/gltf2.js';
+    import { SkyboxNode } from './js/render/nodes/skybox.js';
+    import { QueryArgs } from './js/util/query-args.js';
+
+    import WebXRPolyfill from './js/third-party/webxr-polyfill/build/webxr-polyfill.module.js';
+    if (QueryArgs.getBool('usePolyfill', true)) {
+      let polyfill = new WebXRPolyfill();
+    }
+
+    let xrButton = null;
+    let xrSession = null;
+    let xrRefSpace = null;
+
+    let gl = null;
+    let renderer = null;
+    let scene = new Scene();
+
+    scene.addNode(new Gltf2Node({url: 'media/gltf/camp/ciudad.gltf'}));
+    scene.addNode(new SkyboxNode({url: 'media/textures/textura.png'}));
+    scene.standingStats(true);
+
+    // ============================================================
+    // CÁMARA CON GAMEPAD + CRUCETA PARA BLOQUEO DE EJES
+    // ============================================================
+    const VIEWER_HEIGHT = 1.6;
+    let camYaw = 0;
+    let camPitch = 0;
+
+    let lockedYaw = null;
+    let lockedPitch = null;
+
+    function getXboxGamepad() {
+      let gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
+      for (let gp of gamepads) {
+        if (gp && gp.connected && gp.id && gp.id.toLowerCase().includes('xbox')) {
+          return gp;
+        }
+      }
+      for (let gp of gamepads) {
+        if (gp && gp.connected && gp.axes && gp.axes.length >= 4) {
+          return gp;
+        }
+      }
+      return null;
+    }
+
+    function updateGamepadCamera() {
+      let gp = getXboxGamepad();
+      if (!gp) return;
+
+      const DEADZONE = 0.15;
+      const SENSITIVITY = 0.03;
+
+      let dpadUp = gp.buttons[12] && gp.buttons[12].pressed;
+      let dpadDown = gp.buttons[13] && gp.buttons[13].pressed;
+      let dpadLeft = gp.buttons[14] && gp.buttons[14].pressed;
+      let dpadRight = gp.buttons[15] && gp.buttons[15].pressed;
+
+      let dpadHorizontal = dpadLeft || dpadRight;
+      let dpadVertical = dpadUp || dpadDown;
+
+      if (dpadHorizontal && lockedPitch === null) {
+        lockedPitch = camPitch;
+      }
+      if (dpadVertical && lockedYaw === null) {
+        lockedYaw = camYaw;
+      }
+
+      if (!dpadHorizontal) lockedPitch = null;
+      if (!dpadVertical) lockedYaw = null;
+
+      let rx = gp.axes[2];
+      let ry = gp.axes[3];
+
+      if (lockedYaw === null && Math.abs(rx) > DEADZONE) {
+        camYaw -= rx * SENSITIVITY;
+      }
+
+      // CORREGIDO: -= en lugar de += para que arriba del stick sea arriba
+      if (lockedPitch === null && Math.abs(ry) > DEADZONE) {
+        camPitch -= ry * SENSITIVITY;
+      }
+
+      camPitch = Math.max(-Math.PI * 0.5, Math.min(Math.PI * 0.5, camPitch));
+      while (camYaw > Math.PI) camYaw -= 2 * Math.PI;
+      while (camYaw < -Math.PI) camYaw += 2 * Math.PI;
+    }
+    // ============================================================
+
+    function initXR() {
+      xrButton = new WebXRButton({
+        onRequestSession: onRequestSession,
+        onEndSession: onEndSession,
+        textEnterXR: "INICIAR PANORAMA",
+        textXRNotFound: "XR NO SOPORTADO",
+        textLeaveXR: "SALIR"
+      });
+      document.querySelector('header').appendChild(xrButton.domElement);
+
+      if (navigator.xr) {
+        navigator.xr.isSessionSupported('inline').then((supported) => {
+          xrButton.enabled = supported;
+        });
+      }
+    }
+
+    function onRequestSession() {
+      return navigator.xr.requestSession('inline', {
+        requiredFeatures: ['viewer']
+      }).then(onSessionStarted);
+    }
+
+    function onSessionStarted(session) {
+      xrSession = session;
+      xrButton.setSession(session);
+      session.addEventListener('end', onSessionEnded);
+
+      initGL();
+
+      let glLayer = new XRWebGLLayer(session, gl);
+      session.updateRenderState({ baseLayer: glLayer });
+
+      session.requestReferenceSpace('viewer').then((refSpace) => {
+        xrRefSpace = refSpace;
+        session.requestAnimationFrame(onXRFrame);
+      });
+    }
+
+    function initGL() {
+      if (gl) return;
+      gl = createWebGLContext({ xrCompatible: true });
+      document.body.appendChild(gl.canvas);
+
+      onResize();
+      window.addEventListener('resize', onResize);
+
+      renderer = new Renderer(gl);
+      scene.setRenderer(renderer);
+    }
+
+    function onResize() {
+      if (!gl) return;
+      gl.canvas.width = gl.canvas.clientWidth * window.devicePixelRatio;
+      gl.canvas.height = gl.canvas.clientHeight * window.devicePixelRatio;
+    }
+
+    function onEndSession(session) {
+      session.end();
+    }
+
+    function onSessionEnded(event) {
+      xrButton.setSession(null);
+      xrSession = null;
+    }
+
+    function onXRFrame(t, frame) {
+      let session = frame.session;
+
+      updateGamepadCamera();
+
+      let refSpace = xrRefSpace;
+
+      let halfYaw = -camYaw * 0.5;
+      let halfPitch = -camPitch * 0.5;
+      let cy = Math.cos(halfYaw);
+      let sy = Math.sin(halfYaw);
+      let cp = Math.cos(halfPitch);
+      let sp = Math.sin(halfPitch);
+
+      let q = {
+        w: cp * cy,
+        x: sp * cy,
+        y: cp * sy,
+        z: sp * sy
+      };
+
+      let xform = new XRRigidTransform(
+        { x: 0, y: 0, z: 0 },
+        { x: q.x, y: q.y, z: q.z, w: q.w }
+      );
+      refSpace = refSpace.getOffsetReferenceSpace(xform);
+
+      xform = new XRRigidTransform({ y: -VIEWER_HEIGHT });
+      refSpace = refSpace.getOffsetReferenceSpace(xform);
+
+      let pose = frame.getViewerPose(refSpace);
+
+      scene.startFrame();
+      session.requestAnimationFrame(onXRFrame);
+
+      if (pose) {
+        scene.drawXRFrame(frame, pose);
+      }
+
+      scene.endFrame();
+    }
+
+    initXR();
+  </script>
+</body>
+</html>
